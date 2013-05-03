@@ -86,7 +86,7 @@
     <IntermediateOutputPath>obj\$(TargetFrameworkVersion)\</IntermediateOutputPath>
     <OutputPath>bin\$(TargetFrameworkVersion)\Debug\</OutputPath>
     <BaseIntermediateOutputPath>obj\$(TargetFrameworkVersion)\Debug\</BaseIntermediateOutputPath>
-    <DefineConstants>TRACE;DEBUG;NET_40_OR_GREATER; NET_45_OR_GREATER; NOSIGN</DefineConstants>
+    <DefineConstants>TRACE;DEBUG;NET_40_OR_GREATER; NET_45_OR_GREATER; NOSIGN; EF6</DefineConstants>
     <ErrorReport>prompt</ErrorReport>
     <WarningLevel>4</WarningLevel>
     <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
@@ -109,7 +109,6 @@
       <ItemGroup>
         <Reference Include="System" />
         <Reference Include="System.Core" />
-        <Reference Include="System.Data.Entity" />
         <Reference Include="System.Data.DataSetExtensions" />
         <Reference Include="System.Data" />
         <Reference Include="System.Xml" />
