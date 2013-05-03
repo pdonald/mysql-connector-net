@@ -22,9 +22,15 @@
 
 using System;
 using System.Data.Common;
+#if EF6
+using System.Data.Entity.Core.Common;
+using System.Data.Entity.Core.Metadata.Edm;
+using System.Data.Entity.Core.Common.CommandTrees;
+#else
 using System.Data.Common.CommandTrees;
-using System.Collections.Generic;
 using System.Data.Metadata.Edm;
+#endif
+using System.Collections.Generic;
 using System.Data;
 using MySql.Data.Entity;
 using System.Reflection;
@@ -34,7 +40,11 @@ using System.Text;
 using System.Linq;
 using System.Globalization;
 #if NET_45_OR_GREATER
+#if EF6
+using System.Data.Entity.Spatial;
+#else
 using System.Data.Spatial;
+#endif
 #endif
 using MySql.Data.Common;
 

@@ -22,7 +22,11 @@
 
 using System;
 using System.Data.Common;
+#if EF6
+using System.Data.Entity.Core.Metadata.Edm;
+#else
 using System.Data.Metadata.Edm;
+#endif
 using System.Data;
 using MySql.Data.MySqlClient;
 

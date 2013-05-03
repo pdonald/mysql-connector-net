@@ -24,8 +24,13 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
+#if EF6
+using System.Data.Entity.Core.Common.CommandTrees;
+using System.Data.Entity.Core.Metadata.Edm;
+#else
 using System.Data.Common.CommandTrees;
 using System.Data.Metadata.Edm;
+#endif
 using System.Data;
 
 namespace MySql.Data.Entity

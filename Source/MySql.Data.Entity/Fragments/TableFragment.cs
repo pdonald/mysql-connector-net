@@ -23,7 +23,11 @@
 using System;
 using System.Collections.Generic;
 using System.Text;
+#if EF6
+using System.Data.Entity.Core.Metadata.Edm;
+#else
 using System.Data.Metadata.Edm;
+#endif
 using System.Diagnostics;
 
 namespace MySql.Data.Entity

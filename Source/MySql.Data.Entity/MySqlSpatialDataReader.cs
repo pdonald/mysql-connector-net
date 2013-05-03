@@ -22,7 +22,11 @@
 
 using System;
 using System.Collections.Generic;
+#if EF6
+using System.Data.Entity.Spatial;
+#else
 using System.Data.Spatial;
+#endif
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -78,6 +82,21 @@ namespace MySql.Data.Entity
                 "Invalid Geometry type reading operation on type {0}",
                 fieldTypeName));
       }
+    }
+
+    public override bool IsGeographyColumn(int ordinal)
+    {
+        // TODO: New in Entity Framework v6
+        return false; // hack
+    }
+
+    public override bool IsGeometryColumn(int ordinal)
+    {
+        // TODO: New in Entity Framework v6
+        
+        // hack
+        string fieldTypeName = this.reader.GetDataTypeName(ordinal);
+        return fieldTypeName.Equals("Geometry", StringComparison.Ordinal);
     }
   }
 }

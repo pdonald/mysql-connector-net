@@ -21,8 +21,12 @@
 // 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 
 using System.Text;
+#if EF6
+using System.Data.Entity.Core.Common.CommandTrees;
+#else
 using System.Data.Common.CommandTrees;
 using System.Data.Metadata.Edm;
+#endif
 using MySql.Data.MySqlClient;
 
 namespace MySql.Data.Entity

@@ -25,7 +25,11 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
+#if EF6
+using System.Data.Entity.Spatial;
+#else
 using System.Data.Spatial;
+#endif
 using MySql.Data.Types;
 using MySql.Data.MySqlClient;
 

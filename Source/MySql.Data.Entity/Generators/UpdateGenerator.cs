@@ -22,8 +22,13 @@
 
 using System;
 using System.Text;
+#if EF6
+using System.Data.Entity.Core.Common.CommandTrees;
+using System.Data.Entity.Core.Metadata.Edm;
+#else
 using System.Data.Common.CommandTrees;
 using System.Data.Metadata.Edm;
+#endif
 using System.Diagnostics;
 using MySql.Data.MySqlClient;
 using System.Collections.Generic;
@@ -75,7 +80,11 @@ namespace MySql.Data.Entity
       SelectStatement select = base.GenerateReturningSql(tree, returning);
       ListFragment where = new ListFragment();
       where.Append(" row_count() > 0 and ");
+#if EF6
+      where.Append( ((System.Data.Entity.Core.Common.CommandTrees.DbUpdateCommandTree)tree).Predicate.Accept(this) );
+#else
       where.Append( ((System.Data.Common.CommandTrees.DbUpdateCommandTree)tree).Predicate.Accept(this) );
+#endif
       select.Where = where;
 
       return select;

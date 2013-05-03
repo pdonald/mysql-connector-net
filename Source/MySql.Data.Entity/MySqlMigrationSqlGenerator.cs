@@ -28,7 +28,12 @@ using System.Data.Common;
 using System.Data.Entity.Migrations.Sql;
 using System.Data.Entity.Migrations.Model;
 using MySql.Data.MySqlClient;
+#if EF6
+using System.Data.Entity.Core.Common;
+using System.Data.Entity.Core.Metadata.Edm;
+#else
 using System.Data.Metadata.Edm;
+#endif
 using System.Data.Entity.Migrations.Design;
 using System.Data.Entity.Migrations.Utilities;
 using System.Collections;
@@ -176,13 +181,17 @@ namespace MySql.Data.Entity
       _dispatcher.Add("AlterColumnOperation", (OpDispatcher)((op) => { return Generate(op as AlterColumnOperation); }));
       _dispatcher.Add("CreateIndexOperation", (OpDispatcher)((op) => { return Generate(op as CreateIndexOperation); }));
       _dispatcher.Add("CreateTableOperation", (OpDispatcher)((op) => { return Generate(op as CreateTableOperation); }));
+#if !EF6
       _dispatcher.Add("DeleteHistoryOperation", (OpDispatcher)((op) => { return Generate(op as DeleteHistoryOperation); }));
+#endif
       _dispatcher.Add("DropColumnOperation", (OpDispatcher)((op) => { return Generate(op as DropColumnOperation); }));
       _dispatcher.Add("DropForeignKeyOperation", (OpDispatcher)((op) => { return Generate(op as DropForeignKeyOperation); }));
       _dispatcher.Add("DropIndexOperation", (OpDispatcher)((op) => { return Generate(op as DropIndexOperation); }));
       _dispatcher.Add("DropPrimaryKeyOperation", (OpDispatcher)((op) => { return Generate(op as DropPrimaryKeyOperation); }));
       _dispatcher.Add("DropTableOperation", (OpDispatcher)((op) => { return Generate(op as DropTableOperation); }));
+#if !EF6
       _dispatcher.Add("InsertHistoryOperation", (OpDispatcher)((op) => { return Generate(op as InsertHistoryOperation); }));
+#endif
       _dispatcher.Add("MoveTableOperation", (OpDispatcher)((op) => { return Generate(op as MoveTableOperation); }));
       _dispatcher.Add("RenameColumnOperation", (OpDispatcher)((op) => { return Generate(op as RenameColumnOperation); }));
       _dispatcher.Add("RenameTableOperation", (OpDispatcher)((op) => { return Generate(op as RenameTableOperation); }));
@@ -439,10 +448,12 @@ namespace MySql.Data.Entity
       return new MigrationStatement() { Sql = "drop table " + "`" + op.Name + "`" };
     }
 
+#if !EF6
     protected virtual MigrationStatement Generate(DeleteHistoryOperation op)
     {
       return new MigrationStatement { Sql = string.Format("delete from `{0}` where MigrationId = '{1}'", op.Table, op.MigrationId) };
     }
+#endif
 
     protected virtual MigrationStatement Generate(AddPrimaryKeyOperation op)
     {
@@ -481,6 +492,7 @@ namespace MySql.Data.Entity
     }
 
 
+#if !EF6
     protected virtual MigrationStatement Generate(InsertHistoryOperation op)
     {
 
@@ -509,6 +521,7 @@ namespace MySql.Data.Entity
       return new MigrationStatement { Sql = sb.ToString() };
     
     }
+#endif
 
     protected virtual MigrationStatement Generate(RenameTableOperation op)
     {

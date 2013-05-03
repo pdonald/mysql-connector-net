@@ -25,11 +25,19 @@ using System.Data.Common;
 using MySql.Data.MySqlClient;
 using System.Collections;
 using System.Data;
+#if EF6
+using System.Data.Entity.Core.Metadata.Edm;
+#else
 using System.Data.Metadata.Edm;
+#endif
 using System.Globalization;
 using System.Text;
 #if NET_45_OR_GREATER
+#if EF6
+using System.Data.Entity.Spatial;
+#else
 using System.Data.Spatial;
+#endif
 #endif
 using MySql.Data.Types;
 
