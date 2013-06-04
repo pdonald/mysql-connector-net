@@ -24,6 +24,10 @@ using System;
 using System.IO;
 using System.Diagnostics;
 using MySql.Data.Common;
+#if ASYNC
+using System.Threading.Tasks;
+using System.Threading;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -175,6 +179,23 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    public override async Task FlushAsync(CancellationToken cancellationToken)
+    {
+      try
+      {
+        StartTimer(IOKind.Write);
+        await baseStream.FlushAsync();
+        StopTimer();
+      }
+      catch (Exception e)
+      {
+        HandleException(e);
+        throw;
+      }
+    }
+#endif
+
     public override long Length
     {
       get { return baseStream.Length; }
@@ -207,6 +228,24 @@ namespace MySql.Data.MySqlClient
         throw;
       }
     }
+
+#if ASYNC
+    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+      try
+      {
+        StartTimer(IOKind.Read);
+        int retval = await baseStream.ReadAsync(buffer, offset, count);
+        StopTimer();
+        return retval;
+      }
+      catch (Exception e)
+      {
+        HandleException(e);
+        throw;
+      }
+    }
+#endif
 
     public override int ReadByte()
     {
@@ -248,6 +287,23 @@ namespace MySql.Data.MySqlClient
         throw;
       }
     }
+
+#if ASYNC
+    public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+      try
+      {
+        StartTimer(IOKind.Write);
+        await baseStream.WriteAsync(buffer, offset, count);
+        StopTimer();
+      }
+      catch (Exception e)
+      {
+        HandleException(e);
+        throw;
+      }
+    }
+#endif
 
     public override bool CanTimeout
     {

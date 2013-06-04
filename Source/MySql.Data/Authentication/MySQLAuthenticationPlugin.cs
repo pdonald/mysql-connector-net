@@ -26,6 +26,9 @@ using MySql.Data.MySqlClient.Properties;
 using MySql.Data.Common;
 using System.Text;
 using System.Diagnostics;
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient.Authentication
 {
@@ -146,6 +149,53 @@ namespace MySql.Data.MySqlClient.Authentication
       AuthenticationSuccessful();
     }
 
+#if ASYNC
+    internal async Task AuthenticateAsync(bool reset)
+    {
+      CheckConstraints();
+
+      MySqlPacket packet = driver.Packet;
+
+      // send auth response
+      packet.WriteString(GetUsername());
+
+      // now write the password
+      WritePassword(packet);
+
+      if ((Flags & ClientFlags.CONNECT_WITH_DB) != 0 || reset)
+      {
+        if (!String.IsNullOrEmpty(Settings.Database))
+          packet.WriteString(Settings.Database);
+      }
+
+      if (reset)
+        packet.WriteInteger(8, 2);
+
+      if ((Flags & ClientFlags.PLUGIN_AUTH) != 0)
+        packet.WriteString(PluginName);
+
+      driver.SetConnectAttrs();
+      await driver.SendPacketAsync(packet);
+      //read server response
+      packet = await ReadPacketAsync();
+      byte[] b = packet.Buffer;
+      if (b[0] == 0xfe)
+      {
+        if (packet.IsLastPacket)
+        {
+          driver.Close(true);
+          throw new MySqlException( Resources.OldPasswordsNotSupported );
+        }
+        else
+        {
+          HandleAuthChange(packet);
+        }
+      }
+      await driver.ReadOkAsync(false);
+      AuthenticationSuccessful();
+    }
+#endif
+
     private void WritePassword(MySqlPacket packet)
     {
       bool secure = (Flags & ClientFlags.SECURE_CONNECTION) != 0;
@@ -178,6 +228,23 @@ namespace MySql.Data.MySqlClient.Authentication
         return null;
       }
     }
+
+#if ASYNC
+    private async Task<MySqlPacket> ReadPacketAsync()
+    {
+      try
+      {
+        MySqlPacket p = await driver.ReadPacketAsync();
+        return p;
+      }
+      catch (MySqlException ex)
+      {
+        // make sure this is an auth failed ex
+        AuthenticationFailed(ex);
+        return null;
+      }
+    }
+#endif
 
     private void HandleAuthChange(MySqlPacket packet)
     {

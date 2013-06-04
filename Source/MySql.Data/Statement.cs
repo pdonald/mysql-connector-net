@@ -28,6 +28,9 @@ using MySql.Data.Common;
 using System.Data;
 using MySql.Data.MySqlClient.Properties;
 using System.Collections.Generic;
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -77,6 +80,13 @@ namespace MySql.Data.MySqlClient
     {
     }
 
+    public virtual Task CloseAsync(MySqlDataReader reader)
+    {
+        var tcs = new TaskCompletionSource<object>();
+        tcs.SetResult(null);
+        return tcs.Task;
+    }
+
     public virtual void Resolve(bool preparing)
     {
     }
@@ -87,6 +97,15 @@ namespace MySql.Data.MySqlClient
       BindParameters();
       ExecuteNext();
     }
+
+#if ASYNC
+    public virtual async Task ExecuteAsync()
+    {
+      // we keep a reference to this until we are done
+      BindParameters();
+      await ExecuteNextAsync();
+    }
+#endif
 
     public virtual bool ExecuteNext()
     {
@@ -99,6 +118,20 @@ namespace MySql.Data.MySqlClient
       buffers.RemoveAt(0);
       return true;
     }
+
+#if ASYNC
+    public virtual async Task<bool> ExecuteNextAsync()
+    {
+      if (buffers.Count == 0)
+        return false;
+
+      MySqlPacket packet = (MySqlPacket)buffers[0];
+      //MemoryStream ms = stream.InternalBuffer;
+      await Driver.SendQueryAsync(packet);
+      buffers.RemoveAt(0);
+      return true;
+    }
+#endif
 
     protected virtual void BindParameters()
     {

@@ -25,6 +25,10 @@ using System.ComponentModel;
 using System.Data;
 using System.Data.Common;
 using System.Drawing;
+#if ASYNC
+using System.Threading;
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -80,5 +84,12 @@ namespace MySql.Data.MySqlClient
     {
       return ExecuteReader(behavior);
     }
+
+#if ASYNC
+    protected override async Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+      return await ExecuteReaderAsync(behavior, cancellationToken);
+    }
+#endif
   }
 }

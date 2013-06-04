@@ -38,6 +38,9 @@ using MySql.Data.MySqlClient.Properties;
 #if !CF
 using MySql.Data.MySqlClient.Replication;
 #endif
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -276,6 +279,14 @@ namespace MySql.Data.MySqlClient
       canceled = true;
     }
 
+#if ASYNC
+    public async Task CancelAsync()
+    {
+      await connection.CancelQueryAsync(connection.ConnectionTimeout);
+      canceled = true;
+    }
+#endif
+
     /// <summary>
     /// Creates a new instance of a <see cref="MySqlParameter"/> object.
     /// </summary>
@@ -330,6 +341,28 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
+    {
+      int records = -1;
+
+#if !CF && !RT
+      // give our interceptors a shot at it first
+      if ( connection != null && 
+           connection.commandInterceptor != null &&
+           connection.commandInterceptor.ExecuteNonQuery(CommandText, ref records))
+        return records;
+#endif
+
+      // ok, none of our interceptors handled this so we default
+      using (MySqlDataReader reader = await ExecuteReaderAsync())
+      {
+        await reader.CloseAsync();
+        return reader.RecordsAffected;
+      }
+    }
+#endif
+
     internal void ClearCommandTimer()
     {
       if (commandTimer != null)
@@ -349,6 +382,18 @@ namespace MySql.Data.MySqlClient
       ClearCommandTimer();
     }
 
+#if ASYNC
+    internal async Task CloseAsync(MySqlDataReader reader)
+    {
+      if (statement != null)
+        await statement.CloseAsync(reader);
+      await ResetSqlSelectLimitAsync();
+      if (statement != null && connection != null && connection.driver != null)
+        await connection.driver.CloseQueryAsync(connection, statement.StatementId);
+      ClearCommandTimer();
+    }
+#endif
+
     /// <summary>
     /// Reset reader to null, to avoid "There is already an open data reader"
     /// on the next ExecuteReader(). Used in error handling scenarios.
@@ -361,6 +406,17 @@ namespace MySql.Data.MySqlClient
         connection.Reader = null;
       }
     }
+
+#if ASYNC
+    private async Task ResetReaderAsync()
+    {
+      if (connection != null && connection.Reader != null)
+      {
+        await connection.Reader.CloseAsync();
+        connection.Reader = null;
+      }
+    }
+#endif
 
     /// <summary>
     /// Reset SQL_SELECT_LIMIT that could have been modified by CommandBehavior.
@@ -376,6 +432,20 @@ namespace MySql.Data.MySqlClient
         command.ExecuteNonQuery();
       }
     }
+
+#if ASYNC
+    internal async Task ResetSqlSelectLimitAsync()
+    {
+      // if we are supposed to reset the sql select limit, do that here
+      if (resetSqlSelect)
+      {
+        resetSqlSelect = false;
+        MySqlCommand command = new MySqlCommand("SET SQL_SELECT_LIMIT=DEFAULT", connection);
+        command.internallyCreated = true;
+        await command.ExecuteNonQueryAsync();
+      }
+    }
+#endif
 
     /// <include file='docs/mysqlcommand.xml' path='docs/ExecuteReader/*'/>
     public new MySqlDataReader ExecuteReader()
@@ -561,6 +631,196 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    public new Task<MySqlDataReader> ExecuteReaderAsync()
+    {
+      return ExecuteReaderAsync(CommandBehavior.Default, CancellationToken.None);
+    }
+
+    public new Task<MySqlDataReader> ExecuteReaderAsync(CommandBehavior behavior)
+    {
+      return ExecuteReaderAsync(behavior, CancellationToken.None);
+    }
+
+    public new async Task<MySqlDataReader> ExecuteReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
+    {
+#if !CF && !RT
+      // give our interceptors a shot at it first
+      MySqlDataReader interceptedReader = null;
+      if ( connection != null &&
+           connection.commandInterceptor != null && 
+           connection.commandInterceptor.ExecuteReader(CommandText, behavior, ref interceptedReader))
+        return interceptedReader;
+#endif
+      
+      // interceptors didn't handle this so we fall through
+      bool success = false;
+      CheckState();
+      Driver driver = connection.driver;
+
+      cmdText = cmdText.Trim();
+      if (String.IsNullOrEmpty(cmdText))
+        Throw(new InvalidOperationException(Resources.CommandTextNotInitialized));
+
+      string sql = cmdText.Trim(';');
+
+#if !CF
+      // Load balancing getting a new connection
+      if (connection.hasBeenOpen)
+      {
+        ReplicationManager.GetNewConnection(connection.Settings.Server, !IsReadOnlyCommand(sql), connection);
+      }
+#endif
+        
+      
+      //lock(driver)
+      //using (var releaser = await driver.asyncLock.LockAsync()) TODO: !!!!!!!!!!!!!!!!!!!!!!!
+      {
+
+        // We have to recheck that there is no reader, after we got the lock
+        if (connection.Reader != null)
+        {
+          Throw(new MySqlException(Resources.DataReaderOpen));
+        }
+
+#if !CF && !RT
+        System.Transactions.Transaction curTrans = System.Transactions.Transaction.Current;
+
+        if (curTrans != null)
+        {
+          bool inRollback = false;
+          if (driver.CurrentTransaction != null)
+            inRollback = driver.CurrentTransaction.InRollback;
+          if (!inRollback)
+          {
+            System.Transactions.TransactionStatus status = System.Transactions.TransactionStatus.InDoubt;
+            try
+            {
+              // in some cases (during state transitions) this throws
+              // an exception. Ignore exceptions, we're only interested 
+              // whether transaction was aborted or not.
+              status = curTrans.TransactionInformation.Status;
+            }
+            catch (System.Transactions.TransactionException)
+            {
+            }
+            if (status == System.Transactions.TransactionStatus.Aborted)
+              Throw(new System.Transactions.TransactionAbortedException());
+          }
+        }
+#endif
+        commandTimer = new CommandTimer(connection, CommandTimeout);
+
+        lastInsertedId = -1;
+
+        if (CommandType == CommandType.TableDirect)
+          sql = "SELECT * FROM " + sql;
+        else if (CommandType == CommandType.Text)
+        {
+          // validates single word statetment (maybe is a stored procedure call)
+          if (sql.IndexOf(" ") == -1 && !SingleWordKeywords.Contains(sql.ToUpper()))
+          {
+            sql = "call " + sql;
+          }
+        }
+
+        // if we are on a replicated connection, we are only allow readonly statements
+        if (connection.Settings.Replication && !InternallyCreated)
+          EnsureCommandIsReadOnly(sql);
+
+        if (statement == null || !statement.IsPrepared)
+        {
+          if (CommandType == CommandType.StoredProcedure)
+            statement = new StoredProcedure(this, sql);
+          else
+            statement = new PreparableStatement(this, sql);
+        }
+
+        // stored procs are the only statement type that need do anything during resolve
+        statement.Resolve(false);
+
+        // Now that we have completed our resolve step, we can handle our
+        // command behaviors
+        await HandleCommandBehaviorsAsync(behavior);
+
+        updatedRowCount = -1;
+        try
+        {
+          MySqlDataReader reader = new MySqlDataReader(this, statement, behavior);
+          connection.Reader = reader;
+          canceled = false;
+          // execute the statement
+          await statement.ExecuteAsync();
+          // wait for data to return
+          await reader.NextResultAsync();
+          success = true;
+          return reader;
+        }
+        catch (TimeoutException tex)
+        {
+          connection.HandleTimeoutOrThreadAbort(tex);
+          throw; //unreached
+        }
+        catch (ThreadAbortException taex)
+        {
+          connection.HandleTimeoutOrThreadAbort(taex);
+          throw;
+        }
+        catch (IOException ioex)
+        {
+          connection.Abort(); // Closes connection without returning it to the pool
+          throw new MySqlException(Resources.FatalErrorDuringExecute, ioex);
+        }
+        catch (MySqlException ex)
+        {
+
+          if (ex.InnerException is TimeoutException)
+            throw; // already handled
+
+          try
+          {
+            ResetReader();
+            ResetSqlSelectLimit();
+          }
+          catch (Exception)
+          {
+            // Reset SqlLimit did not work, connection is hosed.
+            Connection.Abort();
+            throw new MySqlException(ex.Message, true, ex);
+          }
+
+          // if we caught an exception because of a cancel, then just return null
+          if (ex.IsQueryAborted)
+            return null;
+          if (ex.IsFatal)
+            Connection.Close();
+          if (ex.Number == 0)
+            throw new MySqlException(Resources.FatalErrorDuringExecute, ex);
+          throw;
+        }
+        finally
+        {
+          if (connection != null)
+          {
+            if (connection.Reader == null)
+            {
+              // Something went seriously wrong,  and reader would not
+              // be able to clear timeout on closing.
+              // So we clear timeout here.
+              ClearCommandTimer();
+            }
+            if (!success)
+            {
+              // ExecuteReader failed.Close Reader and set to null to 
+              // prevent subsequent errors with DataReaderOpen
+              ResetReader();
+            }
+          }
+        }
+      }
+    }
+#endif
+
     private void EnsureCommandIsReadOnly(string sql)
     {
       sql = StringUtility.ToLowerInvariant(sql);
@@ -600,6 +860,30 @@ namespace MySql.Data.MySqlClient
       return val;
     }
 
+#if ASYNC
+    public override async Task<object> ExecuteScalarAsync(CancellationToken cancellationToken)
+    {
+      lastInsertedId = -1;
+      object val = null;
+
+#if !CF && !RT
+      // give our interceptors a shot at it first
+      if (connection != null &&
+          connection.commandInterceptor.ExecuteScalar(CommandText, ref val))
+        return val;
+#endif
+
+      MySqlDataReader reader = await ExecuteReaderAsync();
+      await Async.Using(() => reader, async task =>
+      {
+        if (await reader.ReadAsync())
+          val = reader.GetValue(0);
+      });
+
+      return val;
+    }
+#endif
+
     private void HandleCommandBehaviors(CommandBehavior behavior)
     {
       if ((behavior & CommandBehavior.SchemaOnly) != 0)
@@ -613,6 +897,22 @@ namespace MySql.Data.MySqlClient
         resetSqlSelect = true;
       }
     }
+
+#if ASYNC
+    private async Task HandleCommandBehaviorsAsync(CommandBehavior behavior)
+    {
+      if ((behavior & CommandBehavior.SchemaOnly) != 0)
+      {
+        await new MySqlCommand("SET SQL_SELECT_LIMIT=0", connection).ExecuteNonQueryAsync();
+        resetSqlSelect = true;
+      }
+      else if ((behavior & CommandBehavior.SingleRow) != 0)
+      {
+        await new MySqlCommand("SET SQL_SELECT_LIMIT=1", connection).ExecuteNonQueryAsync();
+        resetSqlSelect = true;
+      }
+    }
+#endif
 
     /// <include file='docs/mysqlcommand.xml' path='docs/Prepare2/*'/>
     private void Prepare(int cursorPageSize)
@@ -961,6 +1261,14 @@ namespace MySql.Data.MySqlClient
       if (statement != null && statement.IsPrepared)
         statement.CloseStatement();
     }
+
+#if ASYNC
+    public async Task DisposeAsync()
+    {
+      if (statement != null && statement.IsPrepared)
+        await statement.CloseStatementAsync();
+    }
+#endif
   }
 }
 

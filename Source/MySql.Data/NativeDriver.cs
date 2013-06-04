@@ -40,6 +40,9 @@ using System.Net.Security;
 using System.Security.Authentication;
 using System.Globalization;
 #endif
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -125,16 +128,38 @@ namespace MySql.Data.MySqlClient
       stream.SendPacket(p);
     }
 
+#if ASYNC
+    internal async Task SendPacketAsync(MySqlPacket p)
+    {
+      await stream.SendPacketAsync(p);
+    }
+#endif
+
     internal void SendEmptyPacket()
     {
       byte[] buffer = new byte[4];
       stream.SendEntirePacketDirectly(buffer, 0);
     }
 
+#if ASYNC
+    internal async Task SendEmptyPacketAsync()
+    {
+      byte[] buffer = new byte[4];
+      await stream.SendEntirePacketDirectlyAsync(buffer, 0);
+    }
+#endif
+
     internal MySqlPacket ReadPacket()
     {
       return packet = stream.ReadPacket();
     }
+
+#if ASYNC
+    internal async Task<MySqlPacket> ReadPacketAsync()
+    {
+      return packet = await stream.ReadPacketAsync();
+    }
+#endif
 
     internal void ReadOk(bool read)
     {
@@ -167,6 +192,39 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    internal async Task ReadOkAsync(bool read)
+    {
+      try
+      {
+        if (read)
+          packet = await stream.ReadPacketAsync();
+        byte marker = (byte)packet.ReadByte();
+        if (marker != 0)
+        {
+          throw new MySqlException("Out of sync with server", true, null);
+        }
+
+        packet.ReadFieldLength(); /* affected rows */
+        packet.ReadFieldLength(); /* last insert id */
+        if (packet.HasMoreData)
+        {
+          serverStatus = (ServerStatusFlags)packet.ReadInteger(2);
+          packet.ReadInteger(2);  /* warning count */
+          if (packet.HasMoreData)
+          {
+            packet.ReadLenString();  /* message */
+          }
+        }
+      }
+      catch (MySqlException ex)
+      {
+        HandleException(ex);
+        throw;
+      }
+    }
+#endif
+
     /// <summary>
     /// Sets the current database for the this connection
     /// </summary>
@@ -182,6 +240,24 @@ namespace MySql.Data.MySqlClient
 
       ReadOk(true);
     }
+
+#if ASYNC
+    /// <summary>
+    /// Sets the current database for the this connection
+    /// </summary>
+    /// <param name="dbName"></param>
+    public async Task SetDatabaseAsync(string dbName)
+    {
+      byte[] dbNameBytes = Encoding.GetBytes(dbName);
+
+      packet.Clear();
+      packet.WriteByte((byte)DBCmd.INIT_DB);
+      packet.Write(dbNameBytes);
+      await ExecutePacketAsync(packet);
+
+      await ReadOkAsync(true);
+    }
+#endif
 
     public void Configure()
     {
@@ -305,6 +381,124 @@ namespace MySql.Data.MySqlClient
       stream.MaxBlockSize = maxSinglePacket;
     }
 
+#if ASYNC
+    public async Task OpenAsync()
+    {
+      // connect to one of our specified hosts
+      try
+      {
+        baseStream = StreamCreator.GetStream(Settings);
+#if !CF && !RT
+         if (Settings.IncludeSecurityAsserts)
+            MySqlSecurityPermission.CreatePermissionSet(false).Assert();
+#endif
+      }
+      catch (System.Security.SecurityException)
+      {
+        throw;
+      }
+      catch (Exception ex)
+      {
+        throw new MySqlException(Resources.UnableToConnectToHost,
+            (int)MySqlErrorCode.UnableToConnectToHost, ex);
+      }
+      if (baseStream == null)
+        throw new MySqlException(Resources.UnableToConnectToHost,
+            (int)MySqlErrorCode.UnableToConnectToHost);
+
+      int maxSinglePacket = 255 * 255 * 255;
+      stream = new MySqlStream(baseStream, Encoding, false);
+
+      stream.ResetTimeout((int)Settings.ConnectionTimeout * 1000);
+
+      // read off the welcome packet and parse out it's values
+      packet = await stream.ReadPacketAsync();
+      int protocol = packet.ReadByte();
+      string versionString = packet.ReadString();
+      version = DBVersion.Parse(versionString);
+      if (!version.isAtLeast(5, 0, 0))
+        throw new NotSupportedException(Resources.ServerTooOld);
+      threadId = packet.ReadInteger(4);
+      encryptionSeed = packet.ReadString();
+
+      maxSinglePacket = (256 * 256 * 256) - 1;
+
+      // read in Server capabilities if they are provided
+      ClientFlags serverCaps = 0;
+      if (packet.HasMoreData)
+        serverCaps = (ClientFlags)packet.ReadInteger(2);
+
+      /* New protocol with 16 bytes to describe server characteristics */
+      owner.ConnectionCharSetIndex = (int)packet.ReadByte();
+
+      serverStatus = (ServerStatusFlags)packet.ReadInteger(2);
+
+      // Since 5.5, high bits of server caps are stored after status.
+      // Previously, it was part of reserved always 0x00 13-byte filler.
+      uint serverCapsHigh = (uint)packet.ReadInteger(2);
+      serverCaps |= (ClientFlags)(serverCapsHigh << 16);
+
+      packet.Position += 11;
+      string seedPart2 = packet.ReadString();
+      encryptionSeed += seedPart2;
+
+      string authenticationMethod = "";
+      if ((serverCaps & ClientFlags.PLUGIN_AUTH) != 0)
+      {
+        authenticationMethod = packet.ReadString();
+      }
+      else
+      {
+        // Some MySql versions like 5.1, don't give name of plugin, default to native password.
+        authenticationMethod = "mysql_native_password";
+      }
+
+      // based on our settings, set our connection flags
+      SetConnectionFlags(serverCaps);
+
+      packet.Clear();
+      packet.WriteInteger((int)connectionFlags, 4);
+
+#if !CF && !RT
+      if ((serverCaps & ClientFlags.SSL) == 0)
+      {
+        if ((Settings.SslMode != MySqlSslMode.None)
+        && (Settings.SslMode != MySqlSslMode.Preferred))
+        {
+          // Client requires SSL connections.
+          string message = String.Format(Resources.NoServerSSLSupport,
+              Settings.Server);
+          throw new MySqlException(message);
+        }
+      }
+      else if (Settings.SslMode != MySqlSslMode.None)
+      {
+        await stream.SendPacketAsync(packet);
+        StartSSL();
+        packet.Clear();
+        packet.WriteInteger((int)connectionFlags, 4);
+      }
+#endif
+
+      packet.WriteInteger(maxSinglePacket, 4);
+      packet.WriteByte(8);
+      packet.Write(new byte[23]);
+
+      await AuthenticateAsync(authenticationMethod, false);
+
+      // if we are using compression, then we use our CompressedStream class
+      // to hide the ugliness of managing the compression
+      if ((connectionFlags & ClientFlags.COMPRESS) != 0)
+        stream = new MySqlStream(baseStream, Encoding, true);
+
+      // give our stream the server version we are connected to.  
+      // We may have some fields that are read differently based 
+      // on the version of the server we are connected to.
+      packet.Version = version;
+      stream.MaxBlockSize = maxSinglePacket;
+    }
+#endif
+
 #if !CF && !RT
 
     #region SSL
@@ -373,6 +567,21 @@ namespace MySql.Data.MySqlClient
       stream.SequenceByte = 2;
 
     }
+
+#if ASYNC
+    private async Task StartSSLAsync()
+    {
+      RemoteCertificateValidationCallback sslValidateCallback =
+          new RemoteCertificateValidationCallback(ServerCheckValidation);
+      SslStream ss = new SslStream(baseStream, true, sslValidateCallback, null);
+      X509CertificateCollection certs = GetClientCertificates();
+      await ss.AuthenticateAsClientAsync(Settings.Server, certs, SslProtocols.Default, false);
+      baseStream = ss;
+      stream = new MySqlStream(ss, Encoding, false);
+      stream.SequenceByte = 2;
+
+    }
+#endif
 
     private bool ServerCheckValidation(object sender, X509Certificate certificate,
                                               X509Chain chain, SslPolicyErrors sslPolicyErrors)
@@ -489,6 +698,23 @@ namespace MySql.Data.MySqlClient
       authPlugin.Authenticate(reset);
     }
 
+#if ASYNC
+    public async Task AuthenticateAsync(string authMethod, bool reset)
+    {
+      if (authMethod != null)
+      {
+        byte[] seedBytes = Encoding.GetBytes(encryptionSeed);
+
+        // Integrated security is a shortcut for windows auth
+        if (Settings.IntegratedSecurity)
+          authMethod = "authentication_windows_client";
+
+        authPlugin = MySqlAuthenticationPlugin.GetPlugin(authMethod, this, seedBytes);
+      }
+      await authPlugin.AuthenticateAsync(reset);
+    }
+#endif
+
     #endregion
 
     public void Reset()
@@ -500,6 +726,18 @@ namespace MySql.Data.MySqlClient
       packet.WriteByte((byte)DBCmd.CHANGE_USER);
       Authenticate(null, true);
     }
+
+#if ASYNC
+    public async Task ResetAsync()
+    {
+      warnings = 0;
+      stream.Encoding = this.Encoding;
+      stream.SequenceByte = 0;
+      packet.Clear();
+      packet.WriteByte((byte)DBCmd.CHANGE_USER);
+      await AuthenticateAsync(null, true);
+    }
+#endif
 
     /// <summary>
     /// Query is the method that is called to send all queries to the server
@@ -520,6 +758,28 @@ namespace MySql.Data.MySqlClient
       // This flag will be maintained by ReadResult
       serverStatus |= ServerStatusFlags.AnotherQuery;
     }
+
+#if ASYNC
+    /// <summary>
+    /// Query is the method that is called to send all queries to the server
+    /// </summary>
+    public async Task SendQueryAsync(MySqlPacket queryPacket)
+    {
+      warnings = 0;
+      queryPacket.SetByte(4, (byte)DBCmd.QUERY);
+      await ExecutePacketAsync(queryPacket);
+      // the server will respond in one of several ways with the first byte indicating
+      // the type of response.
+      // 0 == ok packet.  This indicates non-select queries
+      // 0xff == error packet.  This is handled in stream.OpenPacket
+      // > 0 = number of columns in select query
+      // We don't actually read the result here since a single query can generate
+      // multiple resultsets and we don't want to duplicate code.  See ReadResult
+      // Instead we set our internal server status flag to indicate that we have a query waiting.
+      // This flag will be maintained by ReadResult
+      serverStatus |= ServerStatusFlags.AnotherQuery;
+    }
+#endif
 
     public void Close(bool isOpen)
     {
@@ -551,6 +811,38 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    public async Task CloseAsync(bool isOpen)
+    {
+      try
+      {
+        if (isOpen)
+        {
+          try
+          {
+            packet.Clear();
+            packet.WriteByte((byte)DBCmd.QUIT);
+            await ExecutePacketAsync(packet);
+          }
+          catch (Exception)
+          {
+            // Eat exception here. We should try to closing 
+            // the stream anyway.
+          }
+        }
+
+        if (stream != null)
+          stream.Close();
+        stream = null;
+      }
+      catch (Exception)
+      {
+        // we are just going to eat any exceptions
+        // generated here
+      }
+    }
+#endif
+
     public bool Ping()
     {
       try
@@ -566,6 +858,24 @@ namespace MySql.Data.MySqlClient
         return false;
       }
     }
+
+#if ASYNC
+    public async Task<bool> PingAsync()
+    {
+      try
+      {
+        packet.Clear();
+        packet.WriteByte((byte)DBCmd.PING);
+        await ExecutePacketAsync(packet);
+        await ReadOkAsync(true);
+        return true;
+      }
+      catch (Exception)
+      {
+        return false;
+      }
+    }
+#endif
 
     public int GetResult(ref int affectedRow, ref long insertedId)
     {
@@ -612,6 +922,55 @@ namespace MySql.Data.MySqlClient
       return fieldCount;
     }
 
+#if ASYNC
+    public async Task<Tuple<int, int, long>> GetResultAsync()
+    {
+      try
+      {
+        packet = await stream.ReadPacketAsync();
+      }
+      catch (TimeoutException)
+      {
+        // Do not reset serverStatus, allow to reenter, e.g when
+        // ResultSet is closed.
+        throw;
+      }
+      catch (Exception)
+      {
+        serverStatus = 0;
+        throw;
+      }
+
+      int affectedRow = 0;
+      long insertedId = 0;
+      int fieldCount = (int)packet.ReadFieldLength();
+      if (-1 == fieldCount)
+      {
+        string filename = packet.ReadString();
+        await SendFileToServerAsync(filename);
+
+        return await GetResultAsync();
+      }
+      else if (fieldCount == 0)
+      {
+        // the code to read last packet will set these server status vars 
+        // again if necessary.
+        serverStatus &= ~(ServerStatusFlags.AnotherQuery |
+                          ServerStatusFlags.MoreResults);
+        affectedRow = (int)packet.ReadFieldLength();
+        insertedId = (long)packet.ReadFieldLength();
+
+        serverStatus = (ServerStatusFlags)packet.ReadInteger(2);
+        warnings += packet.ReadInteger(2);
+        if (packet.HasMoreData)
+        {
+          packet.ReadLenString(); //TODO: server message
+        }
+      }
+      return Tuple.Create(fieldCount, affectedRow, insertedId);
+    }
+#endif
+
     /// <summary>
     /// Sends the specified file to the server. 
     /// This supports the LOAD DATA LOCAL INFILE
@@ -642,6 +1001,39 @@ namespace MySql.Data.MySqlClient
         throw new MySqlException("Error during LOAD DATA LOCAL INFILE", ex);
       }
     }
+
+#if ASYNC
+    /// <summary>
+    /// Sends the specified file to the server asynchronously.
+    /// This supports the LOAD DATA LOCAL INFILE
+    /// </summary>
+    /// <param name="filename"></param>
+    private async Task SendFileToServerAsync(string filename)
+    {
+      byte[] buffer = new byte[8196];
+
+      long len = 0;
+      try
+      {
+        using (FileStream fs = new FileStream(filename, FileMode.Open,
+            FileAccess.Read))
+        {
+          len = fs.Length;
+          while (len > 0)
+          {
+            int count = await fs.ReadAsync(buffer, 4, (int)(len > 8192 ? 8192 : len));
+            await stream.SendEntirePacketDirectlyAsync(buffer, count);
+            len -= count;
+          }
+          await stream.SendEntirePacketDirectlyAsync(buffer, 0);
+        }
+      }
+      catch (Exception ex)
+      {
+        throw new MySqlException("Error during LOAD DATA LOCAL INFILE", ex);
+      }
+    }
+#endif
 
     private void ReadNullMap(int fieldCount)
     {
@@ -692,6 +1084,15 @@ namespace MySql.Data.MySqlClient
       ReadEOF();
     }
 
+#if ASYNC
+    public async Task GetColumnsDataAsync(MySqlField[] columns)
+    {
+      for (int i = 0; i < columns.Length; i++)
+        await GetColumnDataAsync(columns[i]);
+      await ReadEOFAsync();
+    }
+#endif
+
     private void GetColumnData(MySqlField field)
     {
       stream.Encoding = Encoding;
@@ -729,6 +1130,45 @@ namespace MySql.Data.MySqlClient
       field.SetTypeAndFlags(type, colFlags);
     }
 
+#if ASYNC
+    private async Task GetColumnDataAsync(MySqlField field)
+    {
+      stream.Encoding = Encoding;
+      packet = await stream.ReadPacketAsync();
+      field.Encoding = Encoding;
+      field.CatalogName = packet.ReadLenString();
+      field.DatabaseName = packet.ReadLenString();
+      field.TableName = packet.ReadLenString();
+      field.RealTableName = packet.ReadLenString();
+      field.ColumnName = packet.ReadLenString();
+      field.OriginalColumnName = packet.ReadLenString();
+      packet.ReadByte();
+      field.CharacterSetIndex = packet.ReadInteger(2);
+      field.ColumnLength = packet.ReadInteger(4);
+      MySqlDbType type = (MySqlDbType)packet.ReadByte();
+      ColumnFlags colFlags;
+      if ((connectionFlags & ClientFlags.LONG_FLAG) != 0)
+        colFlags = (ColumnFlags)packet.ReadInteger(2);
+      else
+        colFlags = (ColumnFlags)packet.ReadByte();
+      field.Scale = (byte)packet.ReadByte();
+
+      if (packet.HasMoreData)
+      {
+        packet.ReadInteger(2); // reserved
+      }
+
+      if (type == MySqlDbType.Decimal || type == MySqlDbType.NewDecimal)
+      {
+        field.Precision = (byte)(field.ColumnLength - 2);
+        if ((colFlags & ColumnFlags.UNSIGNED) != 0)
+          field.Precision++;
+      }
+
+      field.SetTypeAndFlags(type, colFlags);
+    }
+#endif
+
     private void ExecutePacket(MySqlPacket packetToExecute)
     {
       try
@@ -744,6 +1184,23 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    private async Task ExecutePacketAsync(MySqlPacket packetToExecute)
+    {
+      try
+      {
+        warnings = 0;
+        stream.SequenceByte = 0;
+        await stream.SendPacketAsync(packetToExecute);
+      }
+      catch (MySqlException ex)
+      {
+        HandleException(ex);
+        throw;
+      }
+    }
+#endif
+
     public void ExecuteStatement(MySqlPacket packetToExecute)
     {
       warnings = 0;
@@ -751,6 +1208,16 @@ namespace MySql.Data.MySqlClient
       ExecutePacket(packetToExecute);
       serverStatus |= ServerStatusFlags.AnotherQuery;
     }
+
+#if ASYNC
+    public async Task ExecuteStatementAsync(MySqlPacket packetToExecute)
+    {
+      warnings = 0;
+      packetToExecute.SetByte(4, (byte)DBCmd.EXECUTE);
+      await ExecutePacketAsync(packetToExecute);
+      serverStatus |= ServerStatusFlags.AnotherQuery;
+    }
+#endif
 
     private void CheckEOF()
     {
@@ -780,6 +1247,14 @@ namespace MySql.Data.MySqlClient
       packet = stream.ReadPacket();
       CheckEOF();
     }
+
+#if ASYNC
+    private async Task ReadEOFAsync()
+    {
+      packet = await stream.ReadPacketAsync();
+      CheckEOF();
+    }
+#endif
 
     public int PrepareStatement(string sql, ref MySqlField[] parameters)
     {
@@ -826,6 +1301,54 @@ namespace MySql.Data.MySqlClient
 
       return statementId;
     }
+
+#if ASYNC
+    public async Task<int> PrepareStatementAsync(string sql, MySqlField[] parameters)
+    {
+      //TODO: check this
+      //ClearFetchedRow();
+
+      packet.Length = sql.Length * 4 + 5;
+      byte[] buffer = packet.Buffer;
+      int len = Encoding.GetBytes(sql, 0, sql.Length, packet.Buffer, 5);
+      packet.Position = len + 5;
+      buffer[4] = (byte)DBCmd.PREPARE;
+      await ExecutePacketAsync(packet);
+
+      packet = await stream.ReadPacketAsync();
+
+      int marker = packet.ReadByte();
+      if (marker != 0)
+        throw new MySqlException("Expected prepared statement marker");
+
+      int statementId = packet.ReadInteger(4);
+      int numCols = packet.ReadInteger(2);
+      int numParams = packet.ReadInteger(2);
+      //TODO: find out what this is needed for
+      packet.ReadInteger(3);
+      if (numParams > 0)
+      {
+        parameters = await owner.GetColumnsAsync(numParams);
+        // we set the encoding for each parameter back to our connection encoding
+        // since we can't trust what is coming back from the server
+        for (int i = 0; i < parameters.Length; i++)
+          parameters[i].Encoding = Encoding;
+      }
+
+      if (numCols > 0)
+      {
+        while (numCols-- > 0)
+        {
+          packet = await stream.ReadPacketAsync();
+          //TODO: handle streaming packets
+        }
+
+        await ReadEOFAsync();
+      }
+
+      return statementId;
+    }
+#endif
 
     //		private void ClearFetchedRow() 
     //		{
@@ -878,6 +1401,28 @@ namespace MySql.Data.MySqlClient
       return true;
     }
 
+#if ASYNC
+    /// <summary>
+    /// FetchDataRowAsync is the method that the data reader calls to see if there is another 
+    /// row to fetch.  In the non-prepared mode, it will simply read the next data packet.
+    /// In the prepared mode (statementId > 0), it will 
+    /// </summary>
+    public async Task<bool> FetchDataRowAsync(int statementId, int columns)
+    {
+      packet = await stream.ReadPacketAsync();
+      if (packet.IsLastPacket)
+      {
+        CheckEOF();
+        return false;
+      }
+      nullMap = null;
+      if (statementId > 0)
+        ReadNullMap(columns);
+
+      return true;
+    }
+#endif
+
     public void CloseStatement(int statementId)
     {
       packet.Clear();
@@ -886,6 +1431,17 @@ namespace MySql.Data.MySqlClient
       stream.SequenceByte = 0;
       stream.SendPacket(packet);
     }
+
+#if ASYNC
+    public async Task CloseStatementAsync(int statementId)
+    {
+      packet.Clear();
+      packet.WriteByte((byte)DBCmd.CLOSE_STMT);
+      packet.WriteInteger((long)statementId, 4);
+      stream.SequenceByte = 0;
+      await stream.SendPacketAsync(packet);
+    }
+#endif
 
     /// <summary>
     /// Execution timeout, in milliseconds. When the accumulated time for network IO exceeds this value

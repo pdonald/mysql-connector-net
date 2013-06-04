@@ -27,6 +27,9 @@ using MySql.Data.MySqlClient.Properties;
 using MySql.Data.Types;
 using System.Diagnostics;
 using System.Collections.Generic;
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -66,11 +69,30 @@ namespace MySql.Data.MySqlClient
       driver = d;
       this.statementId = statementId;
       rowIndex = -1;
-      LoadColumns(numCols);
+      LoadColumns(numCols); // TODO: Async
       isOutputParameters = IsOutputParameterResultSet();
       hasRows = GetNextRow();
       readDone = !hasRows;
     }
+
+#if ASYNC
+    public ResultSet(Driver d, int statementId)
+    {
+      affectedRows = -1;
+      insertedId = -1;
+      driver = d;
+      this.statementId = statementId;
+      rowIndex = -1;
+    }
+
+    public async Task ResultSetAsync(int numCols)
+    {
+      await LoadColumnsAsync(numCols);
+      isOutputParameters = IsOutputParameterResultSet();
+      hasRows = await GetNextRowAsync();
+      readDone = !hasRows;
+    }
+#endif
 
     #region Properties
 
@@ -191,6 +213,16 @@ namespace MySql.Data.MySqlClient
       return fetched;
     }
 
+#if ASYNC
+    private async Task<bool> GetNextRowAsync()
+    {
+      bool fetched = await driver.FetchDataRowAsync(statementId, Size);
+      if (fetched)
+        totalRows++;
+      return fetched;
+    }
+#endif
+
 
     public bool NextRow(CommandBehavior behavior)
     {
@@ -236,6 +268,52 @@ namespace MySql.Data.MySqlClient
       return true;
     }
 
+#if ASYNC
+    public async Task<bool> NextRowAsync(CommandBehavior behavior)
+    {
+      if (readDone)
+      {
+        if (Cached) return CachedNextRow(behavior);
+        return false;
+      }
+
+      if ((behavior & CommandBehavior.SingleRow) != 0 && rowIndex == 0)
+        return false;
+
+      isSequential = (behavior & CommandBehavior.SequentialAccess) != 0;
+      seqIndex = -1;
+
+      // if we are at row index >= 0 then we need to fetch the data row and load it
+      if (rowIndex >= 0)
+      {
+        bool fetched = false;
+        try
+        {
+          fetched = await GetNextRowAsync();
+        }
+        catch (MySqlException ex)
+        {
+          if (ex.IsQueryAborted)
+          {
+            // avoid hanging on Close()
+            readDone = true;
+          }
+          throw;
+        }
+
+        if (!fetched)
+        {
+          readDone = true;
+          return false;
+        }
+      }
+
+      if (!isSequential) await ReadColumnDataAsync(false);
+      rowIndex++;
+      return true;
+    }
+#endif
+
     private bool CachedNextRow(CommandBehavior behavior)
     {
       if ((behavior & CommandBehavior.SingleRow) != 0 && rowIndex == 0)
@@ -278,6 +356,38 @@ namespace MySql.Data.MySqlClient
       driver = null;
       if (Cached) CacheReset();
     }
+
+#if ASYNC
+    public async Task CloseAsync()
+    {
+      if (!readDone)
+      {
+
+        // if we have rows but the user didn't read the first one then mark it as skipped
+        if (HasRows && rowIndex == -1)
+          skippedRows++;
+        try
+        {
+          while (driver.IsOpen && await driver.SkipDataRowAsync())
+          {
+            totalRows++;
+            skippedRows++;
+          }
+        }
+        catch (System.IO.IOException)
+        {
+          // it is ok to eat IO exceptions here, we just want to 
+          // close the result set
+        }
+        readDone = true;
+      }
+      else if (driver == null)
+        CacheClose();
+
+      driver = null;
+      if (Cached) CacheReset();
+    }
+#endif
 
     private void CacheClose()
     {
@@ -340,6 +450,28 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    private async Task LoadColumnsAsync(int numCols)
+    {
+      fields = await driver.GetColumnsAsync(numCols);
+
+      values = new IMySqlValue[numCols];
+      uaFieldsUsed = new bool[numCols];
+      fieldHashCS = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+      fieldHashCI = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+      for (int i = 0; i < fields.Length; i++)
+      {
+        string columnName = fields[i].ColumnName;
+        if (!fieldHashCS.ContainsKey(columnName))
+          fieldHashCS.Add(columnName, i);
+        if (!fieldHashCI.ContainsKey(columnName))
+          fieldHashCI.Add(columnName, i);
+        values[i] = fields[i].GetValueObject();
+      }
+    }
+#endif
+
     private void ReadColumnData(bool outputParms)
     {
       for (int i = 0; i < Size; i++)
@@ -359,5 +491,27 @@ namespace MySql.Data.MySqlClient
           throw new MySqlException(Resources.MoreThanOneOPRow);
       }
     }
+
+#if ASYNC
+    private async Task ReadColumnDataAsync(bool outputParms)
+    {
+      for (int i = 0; i < Size; i++)
+        values[i] = driver.ReadColumnValue(i, fields[i], values[i]);
+
+      // if we are caching then we need to save a copy of this row of data values
+      if (Cached)
+        cachedValues.Add((IMySqlValue[])values.Clone());
+
+      // we don't need to worry about caching the following since you won't have output
+      // params with TableDirect commands
+      if (outputParms)
+      {
+        bool rowExists = await driver.FetchDataRowAsync(statementId, fields.Length);
+        rowIndex = 0;
+        if (rowExists)
+          throw new MySqlException(Resources.MoreThanOneOPRow);
+      }
+    }
+#endif
   }
 }

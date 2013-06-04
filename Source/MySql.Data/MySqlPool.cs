@@ -25,6 +25,9 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 using MySql.Data.MySqlClient.Properties;
 
 namespace MySql.Data.MySqlClient
@@ -162,6 +165,58 @@ namespace MySql.Data.MySqlClient
       return driver;
     }
 
+#if ASYNC
+    private async Task<Driver> GetPooledConnectionAsync()
+    {
+      Driver driver = null;
+
+      // if we don't have an idle connection but we have room for a new
+      // one, then create it here.
+      lock ((idlePool as ICollection).SyncRoot)
+      {
+        if (HasIdleConnections)
+          driver = idlePool.Dequeue();
+      }
+
+      // Obey the connection timeout
+      if (driver != null)
+      {
+        try
+        {
+          driver.ResetTimeout((int)Settings.ConnectionTimeout * 1000);
+        }
+        catch (Exception)
+        {
+          driver.Close();
+          driver = null;
+        }
+      }
+
+      if (driver != null)
+      {
+        // first check to see that the server is still alive
+        if (!(await driver.PingAsync()))
+        {
+          driver.Close();
+          driver = null;
+        }
+        else if (settings.ConnectionReset)
+          // if the user asks us to ping/reset pooled connections
+          // do so now
+          await driver.ResetAsync();
+      }
+      if (driver == null)
+        driver = await CreateNewPooledConnectionAsync();
+
+      Debug.Assert(driver != null);
+      lock ((inUsePool as ICollection).SyncRoot)
+      {
+        inUsePool.Add(driver);
+      }
+      return driver;
+    }
+#endif
+
     /// <summary>
     /// It is assumed that this method is only called from inside an active lock.
     /// </summary>
@@ -173,6 +228,17 @@ namespace MySql.Data.MySqlClient
       driver.Pool = this;
       return driver;
     }
+
+#if ASYNC
+    private async Task<Driver> CreateNewPooledConnectionAsync()
+    {
+      Debug.Assert((maxSize - NumConnections) > 0, "Pool out of sync.");
+
+      Driver driver = await Driver.CreateAsync(settings);
+      driver.Pool = this;
+      return driver;
+    }
+#endif
 
     public void ReleaseConnection(Driver driver)
     {
@@ -245,6 +311,29 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    private async Task<Driver> TryToGetDriverAsync()
+    {
+      int count = Interlocked.Decrement(ref available);
+      if (count < 0)
+      {
+        Interlocked.Increment(ref available);
+        return null;
+      }
+      try
+      {
+        Driver driver = await GetPooledConnectionAsync();
+        return driver;
+      }
+      catch (Exception ex)
+      {
+        MySqlTrace.LogError(-1, ex.Message);
+        Interlocked.Increment(ref available);
+        throw;
+      }
+    }
+#endif
+
     public Driver GetConnection()
     {
       int fullTimeOut = (int)settings.ConnectionTimeout * 1000;
@@ -263,6 +352,27 @@ namespace MySql.Data.MySqlClient
       }
       throw new MySqlException(Resources.TimeoutGettingConnection);
     }
+
+#if ASYNC
+    public async Task<Driver> GetConnectionAsync()
+    {
+      int fullTimeOut = (int)settings.ConnectionTimeout * 1000;
+      int timeOut = fullTimeOut;
+
+      DateTime start = DateTime.Now;
+
+      while (timeOut > 0)
+      {
+        Driver driver = await TryToGetDriverAsync();
+        if (driver != null) return driver;
+
+        // We have no tickets right now, lets wait for one.
+        if (!autoEvent.WaitOne(timeOut, false)) break;
+        timeOut = fullTimeOut - (int)DateTime.Now.Subtract(start).TotalMilliseconds;
+      }
+      throw new MySqlException(Resources.TimeoutGettingConnection);
+    }
+#endif
 
     /// <summary>
     /// Clears this pool of all idle connections and marks this pool and being cleared

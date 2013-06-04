@@ -33,11 +33,17 @@ using MySql.Data.MySqlClient.Properties;
 using MySql.Data.Common;
 using MySql.Data.MySqlClient;
 using System.Threading;
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
   /// <include file='docs/MySqlDataReader.xml' path='docs/ClassSummary/*'/>
   public sealed partial class MySqlDataReader : IDisposable
+#if ASYNC
+      , IDisposableAsync
+#endif
   {
     // The DataReader should always be open when returned to the user.
     private bool isOpen = true;
@@ -253,6 +259,82 @@ namespace MySql.Data.MySqlClient
       connection = null;
       isOpen = false;
     }
+
+#if ASYNC
+    public async Task CloseAsync()
+    {
+      if (!isOpen) return;
+
+      bool shouldCloseConnection = (commandBehavior & CommandBehavior.CloseConnection) != 0;
+      CommandBehavior originalBehavior = commandBehavior;
+
+      // clear all remaining resultsets
+      try
+      {
+        // Temporarily change to Default behavior to allow NextResult to finish properly.
+        if (!originalBehavior.Equals(CommandBehavior.SchemaOnly))
+          commandBehavior = CommandBehavior.Default;
+        while (await NextResultAsync()) { }
+      }
+      catch (MySqlException ex)
+      {
+        // Ignore aborted queries
+        if (!ex.IsQueryAborted)
+        {
+          // ignore IO exceptions.
+          // We are closing or disposing reader, and  do not
+          // want exception to be propagated to used. If socket is
+          // is closed on the server side, next query will run into
+          // IO exception. If reader is closed by GC, we also would 
+          // like to avoid any exception here. 
+          bool isIOException = false;
+          for (Exception exception = ex; exception != null;
+            exception = exception.InnerException)
+          {
+            if (exception is System.IO.IOException)
+            {
+              isIOException = true;
+              break;
+            }
+          }
+          if (!isIOException)
+          {
+            // Ordinary exception (neither IO nor query aborted)
+            throw;
+          }
+        }
+      }
+      catch (System.IO.IOException)
+      {
+        // eat, on the same reason we eat IO exceptions wrapped into 
+        // MySqlExceptions reasons, described above.
+      }
+      finally
+      {
+        // always ensure internal reader is null (Bug #55558)
+        connection.Reader = null;
+        commandBehavior = originalBehavior;
+      }
+      // we now give the command a chance to terminate.  In the case of
+      // stored procedures it needs to update out and inout parameters
+      await command.CloseAsync(this);
+      commandBehavior = CommandBehavior.Default;
+
+      if (this.command.Canceled && connection.driver.Version.isAtLeast(5, 1, 0))
+      {
+        // Issue dummy command to clear kill flag
+        await ClearKillFlagAsync();
+      }
+
+      if (shouldCloseConnection)
+        await connection.CloseAsync();
+
+      command = null;
+      connection.IsInUse = false;
+      connection = null;
+      isOpen = false;
+    }
+#endif
 
     #region TypeSafe Accessors
 
@@ -894,6 +976,84 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    public override async Task<bool> NextResultAsync(CancellationToken cancellationToken)
+    {
+      if (!isOpen)
+        Throw(new MySqlException(Resources.NextResultIsClosed));
+
+      bool isCaching = command.CommandType == CommandType.TableDirect && command.EnableCaching &&
+        (commandBehavior & CommandBehavior.SequentialAccess) == 0;
+
+      // this will clear out any unread data
+      if (resultSet != null)
+      {
+        await resultSet.CloseAsync();
+        if (isCaching)
+          TableCache.AddToCache(command.CommandText, resultSet);
+      }
+
+      // single result means we only return a single resultset.  If we have already
+      // returned one, then we return false
+      // TableDirect is basically a select * from a single table so it will generate
+      // a single result also
+      if (resultSet != null &&
+        ((commandBehavior & CommandBehavior.SingleResult) != 0 || isCaching))
+        return false;
+
+      // next load up the next resultset if any
+      try
+      {
+        do
+        {
+          resultSet = null;
+          // if we are table caching, then try to retrieve the resultSet from the cache
+          if (isCaching)
+            resultSet = TableCache.RetrieveFromCache(command.CommandText,
+              command.CacheAge);
+
+          if (resultSet == null)
+          {
+            resultSet = await driver.NextResultAsync(Statement.StatementId, false);
+            if (resultSet == null) return false;
+            if (resultSet.IsOutputParameters && command.CommandType == CommandType.StoredProcedure)
+            {
+              StoredProcedure sp = statement as StoredProcedure;
+              sp.ProcessOutputParameters(this);
+              await resultSet.CloseAsync();
+              if (!sp.ServerProvidingOutputParameters) return false;
+              // if we are using server side output parameters then we will get our ok packet
+              // *after* the output parameters resultset
+              resultSet = await driver.NextResultAsync(Statement.StatementId, true);
+            }
+            resultSet.Cached = isCaching;
+          }
+
+          if (resultSet.Size == 0)
+          {
+            Command.lastInsertedId = resultSet.InsertedId;
+            if (affectedRows == -1)
+              affectedRows = resultSet.AffectedRows;
+            else
+              affectedRows += resultSet.AffectedRows;
+          }
+        } while (resultSet.Size == 0);
+
+        return true;
+      }
+      catch (MySqlException ex)
+      {
+        if (ex.IsFatal)
+          connection.Abort();
+        if (ex.Number == 0)
+          throw new MySqlException(Resources.FatalErrorReadingResult, ex);
+        if ((commandBehavior & CommandBehavior.CloseConnection) != 0)
+          Close();
+        throw;
+      }
+    }
+#endif
+
     /// <summary>
     /// Advances the MySqlDataReader to the next record.
     /// </summary>
@@ -933,6 +1093,43 @@ namespace MySql.Data.MySqlClient
       }
     }
 
+#if ASYNC
+    public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
+    {
+      if (!isOpen)
+        Throw(new MySqlException("Invalid attempt to Read when reader is closed."));
+      if (resultSet == null)
+        return false;
+
+      try
+      {
+        return await resultSet.NextRowAsync(commandBehavior);
+      }
+      catch (TimeoutException tex)
+      {
+        connection.HandleTimeoutOrThreadAbort(tex);
+        throw; // unreached
+      }
+      catch (ThreadAbortException taex)
+      {
+        connection.HandleTimeoutOrThreadAbort(taex);
+        throw;
+      }
+      catch (MySqlException ex)
+      {
+        if (ex.IsFatal)
+          connection.Abort();
+
+        if (ex.IsQueryAborted)
+        {
+          throw;
+        }
+
+        throw new MySqlException(Resources.FatalErrorDuringRead, ex);
+      }
+    }
+#endif
+
 
     private IMySqlValue GetFieldValue(int index, bool checkNull)
     {
@@ -967,6 +1164,24 @@ namespace MySql.Data.MySqlClient
         if (ex.Number != (int)MySqlErrorCode.NoSuchTable) throw;
       }
     }
+
+#if ASYNC
+    private async Task ClearKillFlagAsync()
+    {
+      // This query will silently crash because of the Kill call that happened before.
+      string dummyStatement = "SELECT * FROM bogus_table LIMIT 0"; /* dummy query used to clear kill flag */
+      MySqlCommand dummyCommand = new MySqlCommand(dummyStatement, connection);
+      dummyCommand.InternallyCreated = true;
+      try
+      {
+        await dummyCommand.ExecuteReaderAsync(); // ExecuteReader catches the exception and returns null, which is expected.
+      }
+      catch (MySqlException ex)
+      {
+        if (ex.Number != (int)MySqlErrorCode.NoSuchTable) throw;
+      }
+    }
+#endif
 
     private void ProcessOutputParameters()
     {
@@ -1027,5 +1242,12 @@ namespace MySql.Data.MySqlClient
     {
       Close();
     }
+
+#if ASYNC
+    public async Task DisposeAsync()
+    {
+      await CloseAsync();
+    }
+#endif
   }
 }

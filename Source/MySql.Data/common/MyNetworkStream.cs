@@ -26,6 +26,10 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Reflection;
+#if ASYNC
+using System.Threading.Tasks;
+using System.Threading;
+#endif
 
 namespace MySql.Data.Common
 {
@@ -123,6 +127,28 @@ namespace MySql.Data.Common
       throw exception;
     }
 
+#if ASYNC
+    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+      int retry = 0;
+      Exception exception = null;
+      do
+      {
+        try
+        {
+          return await base.ReadAsync(buffer, offset, count, cancellationToken);
+        }
+        catch (Exception e)
+        {
+          exception = e;
+          HandleOrRethrowException(e);
+        }
+      }
+      while (++retry < MaxRetryCount);
+      throw exception;
+    }
+#endif
+
     public override int ReadByte()
     {
       int retry = 0;
@@ -164,6 +190,29 @@ namespace MySql.Data.Common
       throw exception;
     }
 
+#if ASYNC
+    public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+      int retry = 0;
+      Exception exception = null;
+      do
+      {
+        try
+        {
+          await base.WriteAsync(buffer, offset, count, cancellationToken);
+          return;
+        }
+        catch (Exception e)
+        {
+          exception = e;
+          HandleOrRethrowException(e);
+        }
+      }
+      while (++retry < MaxRetryCount);
+      throw exception;
+    }
+#endif
+
     public override void Flush()
     {
       int retry = 0;
@@ -184,6 +233,29 @@ namespace MySql.Data.Common
       while (++retry < MaxRetryCount);
       throw exception;
     }
+
+#if ASYNC
+    public override async Task FlushAsync(CancellationToken cancellationToken)
+    {
+      int retry = 0;
+      Exception exception = null;
+      do
+      {
+        try
+        {
+          await base.FlushAsync(cancellationToken);
+          return;
+        }
+        catch (Exception e)
+        {
+          exception = e;
+          HandleOrRethrowException(e);
+        }
+      }
+      while (++retry < MaxRetryCount);
+      throw exception;
+    }
+#endif
 
     #region Create Code
 

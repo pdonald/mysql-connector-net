@@ -41,6 +41,10 @@ using MySql.Data.MySqlClient.Properties;
 #if !CF
 using MySql.Data.MySqlClient.Replication;
 #endif
+#if ASYNC
+using System.Threading;
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -410,6 +414,36 @@ namespace MySql.Data.MySqlClient
       this.database = databaseName;
     }
 
+#if ASYNC
+    public async Task ChangeDatabaseAsync(string databaseName)
+    {
+      if (databaseName == null || databaseName.Trim().Length == 0)
+        Throw(new ArgumentException(Resources.ParameterIsInvalid, "databaseName"));
+
+      if (State != ConnectionState.Open)
+        Throw(new InvalidOperationException(Resources.ConnectionNotOpen));
+
+      // This lock  prevents promotable transaction rollback to run
+      // in parallel
+      using (var releaser = await driver.asyncLock.LockAsync())
+      {
+#if !CF && !RT
+        if (Transaction.Current != null &&
+          Transaction.Current.TransactionInformation.Status == TransactionStatus.Aborted)
+        {
+          Throw(new TransactionAbortedException());
+        }
+#endif
+        // We use default command timeout for SetDatabase
+        using (new CommandTimer(this, (int)Settings.DefaultCommandTimeout))
+        {
+          await driver.SetDatabaseAsync(databaseName);
+        }
+      }
+      this.database = databaseName;
+    }
+#endif
+
     internal void SetState(ConnectionState newConnectionState, bool broadcast)
     {
       if (newConnectionState == connectionState && !broadcast)
@@ -535,6 +569,107 @@ namespace MySql.Data.MySqlClient
       SetState(ConnectionState.Open, true);
     }
 
+#if ASYNC
+    public override async Task OpenAsync(CancellationToken cancellationToken)
+    {
+      if (State == ConnectionState.Open)
+        Throw(new InvalidOperationException(Resources.ConnectionAlreadyOpen));
+
+#if !CF && !RT
+      // start up our interceptors
+      exceptionInterceptor = new ExceptionInterceptor(this);
+      commandInterceptor = new CommandInterceptor(this);
+#endif
+
+      SetState(ConnectionState.Connecting, true);
+
+      AssertPermissions();
+
+#if !CF && !RT
+      // if we are auto enlisting in a current transaction, then we will be
+      // treating the connection as pooled
+      if (Settings.AutoEnlist && Transaction.Current != null)
+      {
+        driver = DriverTransactionManager.GetDriverInTransaction(Transaction.Current);
+        if (driver != null &&
+          (driver.IsInActiveUse ||
+          !driver.Settings.EquivalentTo(this.Settings)))
+          Throw(new NotSupportedException(Resources.MultipleConnectionsInTransactionNotSupported));
+      }
+#endif
+
+      try
+      {
+        MySqlConnectionStringBuilder currentSettings = Settings;
+#if !CF        
+
+        // Load balancing 
+        if (ReplicationManager.IsReplicationGroup(Settings.Server))
+        {
+          if (driver == null)
+          {
+            ReplicationManager.GetNewConnection(Settings.Server, false, this);
+            return;
+          }
+          else
+            currentSettings = driver.Settings;
+        }
+#endif
+
+        if (Settings.Pooling)
+        {
+          MySqlPool pool = MySqlPoolManager.GetPool(currentSettings);
+          if (driver == null || !driver.IsOpen)
+            driver = await pool.GetConnectionAsync();
+          procedureCache = pool.ProcedureCache;
+
+        }
+        else
+        {
+          if (driver == null || !driver.IsOpen)
+            driver = Driver.Create(currentSettings);
+          procedureCache = new ProcedureCache((int)Settings.ProcedureCacheSize);
+        }
+      }
+      catch (Exception ex)
+      {
+        SetState(ConnectionState.Closed, true);
+        throw;
+      }
+
+      // if the user is using old syntax, let them know
+      if (driver.Settings.UseOldSyntax)
+        MySqlTrace.LogWarning(ServerThread,
+          "You are using old syntax that will be removed in future versions");
+
+      SetState(ConnectionState.Open, false);
+      await driver.ConfigureAsync(this);
+
+      if (!(driver.SupportsPasswordExpiration && driver.IsPasswordExpired))
+      {
+        if (Settings.Database != null && Settings.Database != String.Empty)
+          await ChangeDatabaseAsync(Settings.Database);
+      }
+
+      // setup our schema provider
+      schemaProvider = new ISSchemaProvider(this);
+
+#if !CF
+      perfMonitor = new PerformanceMonitor(this);
+#endif
+
+      // if we are opening up inside a current transaction, then autoenlist
+      // TODO: control this with a connection string option
+#if !MONO && !CF && !RT
+      if (Transaction.Current != null && Settings.AutoEnlist)
+        EnlistTransaction(Transaction.Current);
+#endif
+
+      hasBeenOpen = true;
+      SetState(ConnectionState.Open, true);
+    }
+#endif
+
     /// <include file='docs/MySqlConnection.xml' path='docs/CreateCommand/*'/>
     public new MySqlCommand CreateCommand()
     {
@@ -592,6 +727,26 @@ namespace MySql.Data.MySqlClient
       driver = null;
     }
 
+#if ASYNC
+    internal async Task CloseFullyAsync()
+    {
+      if (Settings.Pooling && driver.IsOpen)
+      {
+        // if we are in a transaction, roll it back
+        if (driver.HasStatus(ServerStatusFlags.InTransaction))
+        {
+          MySqlTransaction t = new MySqlTransaction(this, IsolationLevel.Unspecified);
+          await t.RollbackAsync();
+        }
+
+        MySqlPoolManager.ReleaseConnection(driver);
+      }
+      else
+        driver.Close();
+      driver = null;
+    }
+#endif
+
     /// <include file='docs/MySqlConnection.xml' path='docs/Close/*'/>
     public override void Close()
     {
@@ -619,6 +774,35 @@ namespace MySql.Data.MySqlClient
 
       SetState(ConnectionState.Closed, true);
     }
+
+#if ASYNC
+    public async Task CloseAsync()
+    {
+      if (driver != null)
+        driver.IsPasswordExpired = false;
+
+      if (State == ConnectionState.Closed) return;
+
+      if (Reader != null)
+        await Reader.CloseAsync();
+
+      // if the reader was opened with CloseConnection then driver
+      // will be null on the second time through
+      if (driver != null)
+      {
+#if !CF && !RT
+        if (driver.CurrentTransaction == null)
+#endif
+          await CloseFullyAsync();
+#if !CF && !RT
+        else
+          driver.IsInActiveUse = false;
+#endif
+      }
+
+      SetState(ConnectionState.Closed, true);
+    }
+#endif
 
     internal string CurrentDatabase()
     {
@@ -697,6 +881,27 @@ namespace MySql.Data.MySqlClient
         cmd.ExecuteNonQuery();
       }
     }
+
+#if ASYNC
+    public async Task CancelQueryAsync(int timeout)
+    {
+      MySqlConnectionStringBuilder cb = new MySqlConnectionStringBuilder(
+        Settings.ConnectionString);
+      cb.Pooling = false;
+      cb.AutoEnlist = false;
+      cb.ConnectionTimeout = (uint)timeout;
+
+      using (MySqlConnection c = new MySqlConnection(cb.ConnectionString))
+      {
+        c.isKillQueryConnection = true;
+        await c.OpenAsync();
+        string commandText = "KILL QUERY " + ServerThread;
+        MySqlCommand cmd = new MySqlCommand(commandText, c);
+        cmd.CommandTimeout = timeout;
+        await cmd.ExecuteNonQueryAsync();
+      }
+    }
+#endif
 
     #region Routines for timeout support.
 
@@ -804,6 +1009,14 @@ namespace MySql.Data.MySqlClient
       if (State == ConnectionState.Open)
         Close();
     }
+
+#if ASYNC
+    public async Task DisposeAsync()
+    {
+      if (State == ConnectionState.Open)
+        await CloseAsync();
+    }
+#endif
   }
 
   /// <summary>

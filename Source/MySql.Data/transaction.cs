@@ -24,6 +24,9 @@ using System;
 #if !RT
 using System.Data;
 #endif
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -93,6 +96,19 @@ namespace MySql.Data.MySqlClient
       open = false;
     }
 
+#if ASYNC
+    public async Task CommitAsync()
+    {
+      if (conn == null || (conn.State != ConnectionState.Open && !conn.SoftClosed))
+        throw new InvalidOperationException("Connection must be valid and open to commit transaction");
+      if (!open)
+        throw new InvalidOperationException("Transaction has already been committed or is not pending");
+      MySqlCommand cmd = new MySqlCommand("COMMIT", conn);
+      await cmd.ExecuteNonQueryAsync();
+      open = false;
+    }
+#endif
+
     /// <include file='docs/MySqlTransaction.xml' path='docs/Rollback/*'/>
     public override void Rollback()
     {
@@ -104,6 +120,19 @@ namespace MySql.Data.MySqlClient
       cmd.ExecuteNonQuery();
       open = false;
     }
+
+#if ASYNC
+    public async Task RollbackAsync()
+    {
+      if (conn == null || (conn.State != ConnectionState.Open && !conn.SoftClosed))
+        throw new InvalidOperationException("Connection must be valid and open to rollback transaction");
+      if (!open)
+        throw new InvalidOperationException("Transaction has already been rolled back or is not pending");
+      MySqlCommand cmd = new MySqlCommand("ROLLBACK", conn);
+      await cmd.ExecuteNonQueryAsync();
+      open = false;
+    }
+#endif
 
   }
 }

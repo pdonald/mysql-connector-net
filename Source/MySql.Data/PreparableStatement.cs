@@ -26,6 +26,9 @@ using System.Text;
 using System.Collections.Generic;
 using MySql.Data.MySqlClient.Properties;
 using System.Data;
+#if ASYNC
+using System.Threading.Tasks;
+#endif
 
 namespace MySql.Data.MySqlClient
 {
@@ -219,5 +222,15 @@ namespace MySql.Data.MySqlClient
       Driver.CloseStatement(statementId);
       statementId = 0;
     }
+
+#if ASYNC
+    public virtual async Task CloseStatementAsync()
+    {
+      if (!IsPrepared) return;
+
+      await Driver.CloseStatementAsync(statementId);
+      statementId = 0;
+    }
+#endif
   }
 }
